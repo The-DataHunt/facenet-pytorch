@@ -1,10 +1,11 @@
 import logging
-from PIL import Image
+from PIL import Image, ImageDraw
 import requests
 import json
 import io
 import os
 from FaceDetector import FaceDetector
+from base64 import encodebytes
 import torch
 from ts.torch_handler.base_handler import BaseHandler
 import sys
@@ -41,40 +42,57 @@ class FacenetHandler(BaseHandler):
         self.model.eval()
 
         self.initialized = True
-
-    def preprocess_one_image(self, req, i):
-        json_dict = req
-
+    
+    def preprocess_one_image(self, req):
+        json_dict = req['body'] if 'body' in req else req
         img_url    = json_dict['imgurl'] if 'imgurl' in json_dict else ''
         #image_bytes = requests.files['file'] if 'file' in requests.files else None
         image_bytes = json_dict['file'] if 'file' in json_dict else None
         req_image = ('req_image' in json_dict)
 
         if img_url:
-            response = requests.get(img_url.decode('utf-8'))
+            response = requests.get(img_url)
             org_img = Image.open(io.BytesIO(response.content))
         else :
             #image_bytes = image_bytes.read()
             org_img = Image.open(io.BytesIO(image_bytes))
         
         org_img = org_img.convert('RGB')
-        return org_img
+        return org_img, req_image
 
     def preprocess(self, reqs):
-        images = [self.preprocess_one_image(req,i) for i,req in enumerate(reqs)]
-        return images
+        processed = [self.preprocess_one_image(req) for req in reqs]
+        return processed
 
     def inference(self, x):
+        outs = []
         with torch.no_grad():
-            outs = [self.model(d)[0] for d in x]
+            for d in x:
+                dets = self.model(d[0])[0]
+                if d[1] and dets is not None:
+                    frame_draw = d[0].copy()
+                    draw = ImageDraw.Draw(frame_draw)
+                    for box in dets:
+                        draw.rectangle(box.tolist(), outline=(255,0,0), width=5)
+                else:
+                    frame_draw = d[0]
+                
+                outs.append((dets, frame_draw))
         return outs
 
     def postprocess(self, preds):
         output = []
-        for pred in preds:
+        for pred, img in preds:
             # each pred is a 2d-array containing the list of coords
-            if pred is not None : output.append({ "dets" : [ list(coords.astype(str)) for coords in pred ]})
-            else: output.append({"dets" : []})
+            coord_list = [ list(coords.astype(str)) for coords in pred ] if pred is not None else []
+            coord_list = json.dumps(coord_list, indent=2, ensure_ascii=False)
+
+            # save the image into byte array
+            byte_arr = io.BytesIO()
+            img.save(byte_arr, format='JPEG')
+            img = encodebytes(byte_arr.getvalue()).decode('ascii')
+
+            output.append({"detections" : coord_list, "image": img})
         return output
 
 _service = FacenetHandler()
